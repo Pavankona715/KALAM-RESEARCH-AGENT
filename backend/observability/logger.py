@@ -4,6 +4,11 @@ Structured Logging
 Configures structured JSON logging for production observability.
 In development, outputs human-readable colored logs.
 In production, outputs JSON for log aggregation (Datadog, CloudWatch, etc.)
+
+Key design: we use structlog's native PrintLoggerFactory (not stdlib bridge).
+This means we must NOT use structlog.stdlib processors (add_log_level,
+add_logger_name) — those require a stdlib Logger object with a .name attribute.
+Use structlog.processors equivalents instead.
 """
 
 import logging
@@ -22,24 +27,20 @@ def configure_logging() -> None:
     """
     settings = get_settings()
 
-    # Shared processors for both dev and prod
+    # Processors compatible with PrintLoggerFactory (no stdlib bridge needed)
     shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
+        structlog.processors.add_log_level,        # native structlog processor
         structlog.processors.TimeStamper(fmt="iso"),
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.ExceptionRenderer(),
     ]
 
     if settings.is_development:
-        # Human-readable output for development
         processors = shared_processors + [
             structlog.dev.ConsoleRenderer(colors=True)
         ]
     else:
-        # JSON output for production log aggregation
         processors = shared_processors + [
             structlog.processors.dict_tracebacks,
             structlog.processors.JSONRenderer(),
@@ -52,10 +53,9 @@ def configure_logging() -> None:
         ),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=True,
+        cache_logger_on_first_use=False,  # False so tests get fresh config each run
     )
 
-    # Also configure stdlib logging to use structlog
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
@@ -66,7 +66,7 @@ def configure_logging() -> None:
 def get_logger(name: str) -> structlog.BoundLogger:
     """
     Get a named structured logger.
-    
+
     Usage:
         logger = get_logger(__name__)
         logger.info("processing request", user_id="123", tokens=456)
