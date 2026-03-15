@@ -55,7 +55,7 @@ class AppSettings(BaseSettings):
     gemini_api_key: Optional[str] = None
     groq_api_key: Optional[str] = None
 
-    default_llm_model: str = "gpt-4o"
+    default_llm_model: str = "gemini/gemini-2.0-flash"
     default_llm_temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     default_llm_max_tokens: int = Field(default=4096, ge=1)
 

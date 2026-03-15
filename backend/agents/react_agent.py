@@ -98,6 +98,17 @@ class ReActAgent(BaseAgent):
         """
         step = state["step_count"] + 1
 
+        # Hard stop after 3 tool uses — synthesize answer from results
+        if len(state.get("tool_results", [])) >= 3:
+            last_content = self._get_last_content(state)
+            summary = self._summarize_tool_results(state)
+            answer = last_content or f"Based on my research:\n{summary}"
+            return {
+                "step_count": step,
+                "final_answer": answer,
+                "messages": [AIMessage(content=answer)],
+            }
+
         # Safety: hard stop at max_steps
         if step > state["max_steps"]:
             logger.warning(
@@ -214,9 +225,17 @@ class ReActAgent(BaseAgent):
 
         # Execute all tool calls concurrently
         async def execute_one(tool_call: dict):
+            args = tool_call.get("args", {})
+            # llama3.2 sometimes returns args as a JSON string instead of dict
+            if isinstance(args, str):
+                try:
+                    import json
+                    args = json.loads(args)
+                except Exception:
+                    args = {"query": args}  # fallback: treat string as query
             result = await self.tool_registry.execute(
                 tool_call["name"],
-                tool_call.get("args", {}),
+                args,
             )
             return tool_call["id"], tool_call["name"], result
 
@@ -248,7 +267,7 @@ class ReActAgent(BaseAgent):
             tool_results.append({
                 "tool": tool_name,
                 "success": tool_result.success,
-                "output": tool_result.output[:500],  # Truncate for state storage
+                "output": str(tool_result.output or "")[:500],  # Truncate for state storage
             })
 
             logger.debug(
@@ -274,6 +293,10 @@ class ReActAgent(BaseAgent):
         """
         # If final_answer is set, we're done
         if state.get("final_answer"):
+            return "end"
+
+        # Hard stop after 3 tool uses — forces small models to conclude
+        if len(state.get("tool_results", [])) >= 3:
             return "end"
 
         # If there are pending tool calls, execute them
@@ -344,5 +367,5 @@ class ReActAgent(BaseAgent):
         lines = []
         for r in results[-3:]:  # Last 3 results
             status = "✓" if r["success"] else "✗"
-            lines.append(f"{status} {r['tool']}: {r['output'][:200]}")
+            lines.append(f"{status} {r['tool']}: {str(r['output'] or '')[:200]}")
         return "\n".join(lines)

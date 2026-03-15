@@ -49,7 +49,7 @@ class AgentFactory:
     def get_agent(
         self,
         agent_type: str,
-        max_steps: int = 10,
+        max_steps: int = 25,
     ) -> BaseAgent:
         """
         Get a cached agent instance or create a new one.

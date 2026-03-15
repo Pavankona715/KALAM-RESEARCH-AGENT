@@ -1,74 +1,257 @@
 """
-Structured Logging
-==================
-Configures structured JSON logging for production observability.
-In development, outputs human-readable colored logs.
-In production, outputs JSON for log aggregation (Datadog, CloudWatch, etc.)
+Structured logging configuration.
 
-Key design: we use structlog's native PrintLoggerFactory (not stdlib bridge).
-This means we must NOT use structlog.stdlib processors (add_log_level,
-add_logger_name) — those require a stdlib Logger object with a .name attribute.
-Use structlog.processors equivalents instead.
+Design rationale:
+- All log records are emitted as JSON so they can be ingested by any log
+  aggregator (Datadog, Loki, CloudWatch) without parsing rules
+- RequestID and TraceID are injected automatically via a logging.Filter that
+  reads from contextvars — same IDs that tracer.py sets
+- configure_logging() is idempotent and safe to call from conftest.py before
+  any other imports
+- Log level is controlled by LOG_LEVEL env var (default INFO)
 """
 
+from __future__ import annotations
+
+import json
 import logging
-import sys
-from typing import Any
+import logging.config
+import os
+import time
+from contextvars import ContextVar
+from typing import Optional
 
-import structlog
+# ---------------------------------------------------------------------------
+# Context variables (set by RequestLogging middleware)
+# ---------------------------------------------------------------------------
 
-from backend.config.settings import get_settings
+_request_id: ContextVar[Optional[str]] = ContextVar("_request_id", default=None)
+_trace_id: ContextVar[Optional[str]] = ContextVar("_log_trace_id", default=None)
+_user_id: ContextVar[Optional[str]] = ContextVar("_log_user_id", default=None)
 
 
-def configure_logging() -> None:
+def set_log_context(
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> None:
+    """Set log context vars for the current async task."""
+    if request_id is not None:
+        _request_id.set(request_id)
+    if trace_id is not None:
+        _trace_id.set(trace_id)
+    if user_id is not None:
+        _user_id.set(user_id)
+
+
+def clear_log_context() -> None:
+    _request_id.set(None)
+    _trace_id.set(None)
+    _user_id.set(None)
+
+
+# ---------------------------------------------------------------------------
+# JSON formatter
+# ---------------------------------------------------------------------------
+
+
+class JSONFormatter(logging.Formatter):
     """
-    Configure structured logging for the entire application.
-    Call once at startup in main.py.
+    Formats log records as single-line JSON objects.
+
+    Fields always present:
+        timestamp, level, logger, message
+    Fields when available (from context vars or LogRecord extras):
+        request_id, trace_id, user_id, exc_info, duration_ms
     """
-    settings = get_settings()
 
-    # Processors compatible with PrintLoggerFactory (no stdlib bridge needed)
-    shared_processors: list[Any] = [
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,        # native structlog processor
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.ExceptionRenderer(),
-    ]
+    def format(self, record: logging.LogRecord) -> str:
+        log_obj = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
 
-    if settings.is_development:
-        processors = shared_processors + [
-            structlog.dev.ConsoleRenderer(colors=True)
-        ]
-    else:
-        processors = shared_processors + [
-            structlog.processors.dict_tracebacks,
-            structlog.processors.JSONRenderer(),
-        ]
+        # Inject context vars
+        rid = _request_id.get()
+        tid = _trace_id.get()
+        uid = _user_id.get()
+        if rid:
+            log_obj["request_id"] = rid
+        if tid:
+            log_obj["trace_id"] = tid
+        if uid:
+            log_obj["user_id"] = uid
 
-    structlog.configure(
-        processors=processors,
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.DEBUG if settings.app_debug else logging.INFO
-        ),
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=False,  # False so tests get fresh config each run
+        # Extra fields attached via logger.info("...", extra={...})
+        for key in ("duration_ms", "endpoint", "status_code", "agent_run_id", "step"):
+            val = getattr(record, key, None)
+            if val is not None:
+                log_obj[key] = val
+
+        # Exception info
+        if record.exc_info:
+            log_obj["exc_info"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_obj, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# configure_logging (idempotent)
+# ---------------------------------------------------------------------------
+
+_configured = False
+
+
+def configure_logging(log_level: Optional[str] = None) -> None:
+    """
+    Configure root logger with JSON output.
+
+    Safe to call multiple times — subsequent calls are no-ops.
+    Call from conftest.py at module level before any other imports.
+    """
+    global _configured
+    if _configured:
+        return
+    _configured = True
+
+    level = (log_level or os.getenv("LOG_LEVEL", "INFO")).upper()
+
+    formatter = JSONFormatter()
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+    # Quieten noisy third-party loggers
+    for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    logging.getLogger(__name__).info(
+        "Logging configured", extra={"log_level": level}
     )
 
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=logging.DEBUG if settings.app_debug else logging.INFO,
-    )
+
+# ---------------------------------------------------------------------------
+# Agent reasoning trace logger
+# ---------------------------------------------------------------------------
 
 
-def get_logger(name: str) -> structlog.BoundLogger:
+class ReasoningTraceLogger:
     """
-    Get a named structured logger.
+    Records agent reasoning steps to the AgentRun table.
 
-    Usage:
+    Kept separate from the main log stream so reasoning traces can be
+    queried independently via the /agents/{run_id}/trace endpoint.
+    """
+
+    def __init__(self) -> None:
+        self._logger = logging.getLogger("agent.reasoning")
+
+    def log_step(
+        self,
+        agent_run_id: str,
+        step_type: str,
+        content: str,
+        tool_name: Optional[str] = None,
+        duration_ms: Optional[float] = None,
+    ) -> None:
+        self._logger.info(
+            "agent_step",
+            extra={
+                "agent_run_id": agent_run_id,
+                "step_type": step_type,
+                "content": content[:2000],  # truncate to avoid huge logs
+                "tool_name": tool_name,
+                "duration_ms": duration_ms,
+            },
+        )
+
+    def log_final_answer(
+        self,
+        agent_run_id: str,
+        answer: str,
+        total_steps: int,
+        total_duration_ms: float,
+    ) -> None:
+        self._logger.info(
+            "agent_final_answer",
+            extra={
+                "agent_run_id": agent_run_id,
+                "answer_length": len(answer),
+                "total_steps": total_steps,
+                "total_duration_ms": total_duration_ms,
+            },
+        )
+
+
+_reasoning_logger: Optional[ReasoningTraceLogger] = None
+
+
+def get_reasoning_logger() -> ReasoningTraceLogger:
+    global _reasoning_logger
+    if _reasoning_logger is None:
+        _reasoning_logger = ReasoningTraceLogger()
+    return _reasoning_logger
+
+
+def get_logger(name: str) -> "StructuredLogger":
+    """
+    Return a StructuredLogger by name.
+
+    Drop-in replacement that supports structured keyword arguments:
+        logger.info("event_name", key=value, other=value)
+
+    This matches the calling convention used throughout the codebase
+    (short_term.py, manager.py, qdrant_adapter.py, rag/pipeline.py, etc.)
+    """
+    return StructuredLogger(name)
+
+
+class StructuredLogger:
+    """
+    Thin wrapper around stdlib logging.Logger that accepts keyword
+    arguments and serialises them into the log message.
+
+    Usage (existing codebase pattern):
         logger = get_logger(__name__)
-        logger.info("processing request", user_id="123", tokens=456)
+        logger.info("qdrant_client_initialized", mode="in_memory")
+        logger.warning("tool_not_found", tool_name=name)
+        logger.error("query_embedding_failed", error=str(e))
     """
-    return structlog.get_logger(name)
+
+    def __init__(self, name: str) -> None:
+        self._logger = logging.getLogger(name)
+
+    def _format(self, msg: str, kwargs: dict) -> str:
+        if not kwargs:
+            return msg
+        pairs = " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+        return f"{msg} {pairs}"
+
+    def debug(self, msg: str, *args, **kwargs) -> None:
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(self._format(msg, kwargs), *args)
+
+    def info(self, msg: str, *args, **kwargs) -> None:
+        if self._logger.isEnabledFor(logging.INFO):
+            self._logger.info(self._format(msg, kwargs), *args)
+
+    def warning(self, msg: str, *args, **kwargs) -> None:
+        if self._logger.isEnabledFor(logging.WARNING):
+            self._logger.warning(self._format(msg, kwargs), *args)
+
+    def error(self, msg: str, *args, **kwargs) -> None:
+        if self._logger.isEnabledFor(logging.ERROR):
+            self._logger.error(self._format(msg, kwargs), *args)
+
+    def critical(self, msg: str, *args, **kwargs) -> None:
+        if self._logger.isEnabledFor(logging.CRITICAL):
+            self._logger.critical(self._format(msg, kwargs), *args)
+
+    def exception(self, msg: str, *args, **kwargs) -> None:
+        self._logger.exception(self._format(msg, kwargs), *args)

@@ -8,6 +8,13 @@ DELETE /chat/sessions/{session_id} — Delete a session.
 
 The actual agent logic lives in backend/agents/ — this route is just
 the HTTP adapter. It validates input, calls the agent, persists results.
+
+Step 14 additions:
+- InputValidator  — prompt injection / content policy check before agent runs
+- OutputValidator — leakage / PII check on the assistant reply
+- PermissionChecker — filters the tool allowlist to what the user's role permits
+- AgentTracer     — LangSmith + OTel spans around the full request and sub-steps
+- MetricsCollector — token usage + latency + error rate tracking
 """
 
 import time
@@ -22,10 +29,15 @@ from backend.api.dependencies import CurrentUser, DBSession, Pagination
 from backend.agents.orchestrator import AgentFactory, get_agent_factory
 from backend.db.models.chat import MessageRole
 from backend.db.repositories.chat_repo import chat_message_repo, chat_session_repo
+from backend.guardrails.input_validator import InputValidator, get_input_validator
+from backend.guardrails.output_validator import OutputValidator, get_output_validator
+from backend.guardrails.permissions import PermissionChecker, get_permission_checker
 from backend.llm import get_llm_router
 from backend.llm.router import LLMRouter
-from backend.observability.logger import get_logger
 from backend.memory.manager import MemoryManager, get_memory_manager
+from backend.observability.logger import get_logger
+from backend.observability.metrics import MetricsCollector, get_metrics_collector
+from backend.observability.tracer import AgentTracer, get_tracer
 from backend.rag.retriever import get_retriever
 
 logger = get_logger(__name__)
@@ -33,6 +45,7 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 
 # ─── Request / Response Schemas ───────────────────────────────────────────────
+
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=32_000)
@@ -63,6 +76,9 @@ class ChatResponse(BaseModel):
     session_id: uuid.UUID
     message: MessageResponse
     agent_run_id: Optional[uuid.UUID] = None
+    # Step 14 additions — observability / guardrail metadata
+    trace_id: Optional[str] = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class SessionSummary(BaseModel):
@@ -88,6 +104,7 @@ class SessionDetail(BaseModel):
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
+
 @router.post("", response_model=ChatResponse, status_code=status.HTTP_200_OK)
 async def chat(
     request: ChatRequest,
@@ -96,6 +113,12 @@ async def chat(
     llm: Annotated[LLMRouter, Depends(get_llm_router)],
     agent_factory: Annotated[AgentFactory, Depends(get_agent_factory)],
     memory: Annotated["MemoryManager", Depends(get_memory_manager)],
+    # ── Step 14: guardrails + observability (all have module-level fallbacks) ──
+    input_validator: Annotated[InputValidator, Depends(get_input_validator)],
+    output_validator: Annotated[OutputValidator, Depends(get_output_validator)],
+    permission_checker: Annotated[PermissionChecker, Depends(get_permission_checker)],
+    tracer: Annotated[AgentTracer, Depends(get_tracer)],
+    metrics: Annotated[MetricsCollector, Depends(get_metrics_collector)],
 ) -> ChatResponse:
     """
     Send a message to the AI agent and receive a response.
@@ -103,97 +126,179 @@ async def chat(
     - Creates a new session if session_id is not provided
     - Persists both user message and assistant response
     - Returns the full assistant response with metadata
-
-    Note: Streaming support (request.stream=True) will be added in Step 4
-    when the LLM layer is complete.
+    - Validates input for injection attacks before agent runs
+    - Validates output for leakage/PII before returning
+    - Enforces tool permissions based on user role
+    - Traces the full request in LangSmith/OTel
+    - Records token usage and latency metrics
     """
-    # 1. Get or create session
-    if request.session_id:
-        session = await chat_session_repo.get_by_id(db, request.session_id)
-        if not session or session.user_id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Session {request.session_id} not found",
+    warnings: list[str] = []
+
+    # ── 1. Input validation (guardrail) ──────────────────────────────────────
+    validation = input_validator.validate(request.message)
+    if validation.should_block:
+        logger.warning(
+            "input_blocked",
+            user_id=str(user.id),
+            risk_score=validation.risk_score,
+            violations=validation.violations,
+        )
+        metrics.record_error("/chat", "input_blocked")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "input_rejected",
+                "reason": "Request contains disallowed content",
+                "violations": validation.violations,
+            },
+        )
+    if validation.risk_score > 0.3:
+        warnings.append(f"input_risk_score:{validation.risk_score:.2f}")
+
+    # ── 2. Permission check — filter tools to user's role allowlist ───────────
+    user_role = getattr(user, "role", "free")
+    allowed_tools = permission_checker.get_allowed_tools(user_role)
+
+    # ── 3. Wrap the entire request in a trace span ────────────────────────────
+    async with tracer.trace_request(
+        endpoint="/chat",
+        user_id=str(user.id),
+        session_id=str(request.session_id) if request.session_id else None,
+    ) as trace_ctx:
+        trace_id: str = trace_ctx["trace_id"]
+
+        # ── 4. Get or create session ──────────────────────────────────────────
+        if request.session_id:
+            session = await chat_session_repo.get_by_id(db, request.session_id)
+            if not session or session.user_id != user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Session {request.session_id} not found",
+                )
+        else:
+            session = await chat_session_repo.create(
+                db,
+                user_id=user.id,
+                agent_type=request.agent_type,
+                title=request.message[:80],
             )
-    else:
-        session = await chat_session_repo.create(
+
+        # ── 5. Persist user message ───────────────────────────────────────────
+        user_message = await chat_message_repo.create_message(
             db,
-            user_id=user.id,
-            agent_type=request.agent_type,
-            title=request.message[:80],  # Use first 80 chars as title
+            session_id=session.id,
+            role=MessageRole.USER,
+            content=request.message,
         )
 
-    # 2. Persist user message
-    user_message = await chat_message_repo.create_message(
-        db,
-        session_id=session.id,
-        role=MessageRole.USER,
-        content=request.message,
-    )
+        # ── 6. Load memory context ────────────────────────────────────────────
+        async with tracer.trace_agent_step("load_memory", trace_id=trace_id):
+            memory_context = await memory.load_context(
+                session_id=str(session.id),
+                user_id=str(user.id),
+                current_query=request.message,
+            )
 
-    # 3. Load memory context (short-term history + long-term relevant memories)
-    memory_context = await memory.load_context(
-        session_id=str(session.id),
-        user_id=str(user.id),
-        current_query=request.message,
-    )
+        # ── 7. RAG retrieval ──────────────────────────────────────────────────
+        async with tracer.trace_agent_step("rag_retrieval", trace_id=trace_id):
+            retriever = get_retriever()
+            try:
+                retrieved_docs = await retriever.retrieve_for_agent(
+                    query=request.message,
+                    session_id=str(session.id),
+                    top_k=5,
+                )
+            except Exception as exc:
+                logger.warning("rag_retrieval_failed", error=str(exc), session_id=str(session.id))
+                retrieved_docs = []
 
-    # 4. Retrieve relevant documents (RAG)
-    retriever = get_retriever()
-    retrieved_docs = await retriever.retrieve_for_agent(
-        query=request.message,
-        session_id=str(session.id),
-        top_k=5,
-    )
+        # ── 8. Run agent ──────────────────────────────────────────────────────
+        start_time = time.perf_counter()
+        agent = agent_factory.get_agent(request.agent_type)
 
-    # 5. Run ReAct agent
-    start_time = time.perf_counter()
-    agent = agent_factory.get_agent(request.agent_type)
+        async with tracer.trace_agent_step("agent_execution", trace_id=trace_id):
+            try:
+                final_state = await agent.run(
+                    user_message=request.message,
+                    session_id=str(session.id),
+                    user_id=str(user.id),
+                    conversation_history=memory_context.conversation_history,
+                    retrieved_docs=retrieved_docs,
+                    # Step 14: pass role-filtered tool list to the agent
+                    allowed_tools=allowed_tools,
+                )
+            except Exception as exc:
+                logger.error(
+                    "agent_run_failed",
+                    error=str(exc),
+                    session_id=str(session.id),
+                )
+                metrics.record_error("/chat", type(exc).__name__)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Agent error: {str(exc)}",
+                )
 
-    try:
-        final_state = await agent.run(
-            user_message=request.message,
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        answer = final_state.get("final_answer") or "I could not generate a response."
+        steps = final_state.get("step_count", 0)
+        tools_used = [r["tool"] for r in final_state.get("tool_results", [])]
+        usage = final_state.get("usage") or {}
+
+        # ── 9. Output validation (guardrail) ──────────────────────────────────
+        out_result = output_validator.validate_text(answer)
+        if not out_result.valid:
+            logger.warning(
+                "output_validation_failed",
+                errors=out_result.errors,
+                session_id=str(session.id),
+            )
+            answer = "I'm sorry, I was unable to generate a valid response. Please try again."
+            warnings.append("output_validation_failed")
+        else:
+            answer = out_result.raw_output
+            if out_result.was_sanitized:
+                warnings.append("output_sanitized")
+            warnings.extend(out_result.warnings)
+
+        # ── 10. Save turn to memory (Redis short-term) ────────────────────────
+        await memory.save_turn(
             session_id=str(session.id),
             user_id=str(user.id),
-            conversation_history=memory_context.conversation_history,
-            retrieved_docs=retrieved_docs,
-        )
-    except Exception as e:
-        logger.error("agent_run_failed", error=str(e), session_id=str(session.id))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Agent error: {str(e)}",
+            user_message=request.message,
+            assistant_response=answer,
         )
 
-    latency_ms = (time.perf_counter() - start_time) * 1000
-    answer = final_state.get("final_answer") or "I could not generate a response."
-    steps = final_state.get("step_count", 0)
-    tools_used = [r["tool"] for r in final_state.get("tool_results", [])]
+        # ── 11. Persist assistant response to PostgreSQL ──────────────────────
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        assistant_message = await chat_message_repo.create_message(
+            db,
+            session_id=session.id,
+            role=MessageRole.ASSISTANT,
+            content=answer,
+            model=request.model or "agent",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=latency_ms,
+        )
 
-    # 5. Save turn to memory (Redis short-term)
-    await memory.save_turn(
-        session_id=str(session.id),
-        user_id=str(user.id),
-        user_message=request.message,
-        assistant_response=answer,
-    )
+        # ── 12. Update session counters ───────────────────────────────────────
+        total_tokens = prompt_tokens + completion_tokens
+        await chat_session_repo.increment_counters(
+            db, session.id, tokens=total_tokens, messages=2
+        )
 
-    # 6. Persist assistant response to PostgreSQL
-    assistant_message = await chat_message_repo.create_message(
-        db,
-        session_id=session.id,
-        role=MessageRole.ASSISTANT,
-        content=answer,
-        model="agent",
-        prompt_tokens=0,
-        completion_tokens=0,
-        latency_ms=latency_ms,
-    )
-
-    # 7. Update session counters
-    await chat_session_repo.increment_counters(
-        db, session.id, tokens=0, messages=2
-    )
+    # ── 13. Record metrics (outside trace span — fire and forget) ─────────────
+    metrics.record_request_latency("/chat", latency_ms)
+    if usage:
+        metrics.record_token_usage(
+            user_id=str(user.id),
+            session_id=str(session.id),
+            model=request.model or "agent",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     logger.info(
         "chat_request",
@@ -204,6 +309,8 @@ async def chat(
         steps=steps,
         tools_used=tools_used,
         latency_ms=round(latency_ms, 2),
+        trace_id=trace_id,
+        warnings=warnings,
     )
 
     return ChatResponse(
@@ -213,9 +320,11 @@ async def chat(
             role=assistant_message.role,
             content=assistant_message.content,
             model=assistant_message.model,
-            tokens_used=0,
+            tokens_used=total_tokens,
             latency_ms=round(latency_ms, 2),
         ),
+        trace_id=trace_id,
+        warnings=warnings,
     )
 
 

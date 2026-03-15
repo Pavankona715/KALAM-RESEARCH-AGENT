@@ -45,7 +45,7 @@ class WikipediaTool(BaseTool):
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Topic or concept to look up on Wikipedia.",
+                "description": "Topic or concept to look up on Wikipedia. Use short names e.g. 'APJ Abdul Kalam' not 'Who is APJ Abdul Kalam'.",
             },
             "sentences": {
                 "type": "integer",
@@ -75,8 +75,25 @@ class WikipediaTool(BaseTool):
                 )
         return self._wiki
 
-    async def _execute(self, query: str, sentences: int = 5) -> str:
+    async def _execute(self, query: str = "", sentences: int = 5, **kwargs) -> str:
         import asyncio
+
+        # Force sentences to int in case llama3.2 sends a string
+        try:
+            sentences = int(sentences) if sentences else 5
+        except (ValueError, TypeError):
+            sentences = 5
+
+        # Guard against empty queries
+        if not query or not query.strip():
+            return "Please provide a search query. Example: 'APJ Abdul Kalam'"
+
+        # Clean up the query — remove question words that confuse Wikipedia lookup
+        clean_query = query.strip()
+        for prefix in ["who is ", "what is ", "tell me about ", "explain "]:
+            if clean_query.lower().startswith(prefix):
+                clean_query = clean_query[len(prefix):]
+                break
 
         wiki = self._get_wiki()
 
@@ -84,16 +101,16 @@ class WikipediaTool(BaseTool):
         loop = asyncio.get_event_loop()
         page = await loop.run_in_executor(
             None,
-            lambda: wiki.page(query)
+            lambda: wiki.page(clean_query)
         )
 
         if not page.exists():
-            # Try a search-based approach
-            return await self._search_fallback(query, sentences)
+            # Try search-based fallback
+            return await self._search_fallback(wiki, clean_query, sentences)
 
         summary = page.summary
         if not summary:
-            return f"No summary available for '{query}' on Wikipedia."
+            return f"No summary available for '{clean_query}' on Wikipedia."
 
         # Return first N sentences
         import re
@@ -106,12 +123,46 @@ class WikipediaTool(BaseTool):
             f"{trimmed}"
         )
 
-    async def _search_fallback(self, query: str, sentences: int) -> str:
-        """If exact page not found, suggest the query wasn't found clearly."""
-        return (
-            f"No Wikipedia article found for '{query}'. "
-            f"Try a more specific or differently worded query."
-        )
+    async def _search_fallback(self, wiki, query: str, sentences: int) -> str:
+        """Search Wikipedia and return the first matching article."""
+        import asyncio
+
+        try:
+            import wikipedia
+
+            loop = asyncio.get_event_loop()
+
+            # Search for matching pages
+            search_results = await loop.run_in_executor(
+                None,
+                lambda: wikipedia.search(query, results=3)
+            )
+
+            if not search_results:
+                return f"No Wikipedia article found for '{query}'."
+
+            # Try the first result
+            page = await loop.run_in_executor(
+                None,
+                lambda: wiki.page(search_results[0])
+            )
+
+            if not page.exists():
+                return f"No Wikipedia article found for '{query}'."
+
+            import re
+            sentence_list = re.split(r"(?<=[.!?])\s+", page.summary)
+            trimmed = " ".join(sentence_list[:sentences])
+
+            return (
+                f"Wikipedia: {page.title}\n"
+                f"URL: {page.fullurl}\n\n"
+                f"{trimmed}"
+            )
+
+        except Exception as e:
+            logger.warning("wikipedia_search_fallback_failed", error=str(e))
+            return f"No Wikipedia article found for '{query}'."
 
 
 # ─── Auto-registration ────────────────────────────────────────────────────────

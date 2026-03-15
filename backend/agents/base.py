@@ -42,7 +42,7 @@ class BaseAgent(ABC):
         self,
         llm: LLMRouter,
         tool_registry: ToolRegistry,
-        max_steps: int = 10,
+        max_steps: int = 25,
     ):
         self.llm = llm
         self.tool_registry = tool_registry
