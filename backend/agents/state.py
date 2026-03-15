@@ -52,6 +52,9 @@ class AgentState(TypedDict):
     final_answer: Optional[str]       # Set when agent is done
     error: Optional[str]              # Set if agent fails
 
+    # Retrieved documents for RAG context
+    retrieved_docs: list[dict]        # Serialized RetrievedDocument objects
+
     # Run metadata (populated by orchestrator)
     run_id: Optional[str]
     metadata: dict[str, Any]
@@ -64,6 +67,7 @@ def create_initial_state(
     agent_type: str = "react",
     max_steps: int = 10,
     conversation_history: Optional[list[dict]] = None,
+    retrieved_docs: Optional[list] = None,
     run_id: Optional[str] = None,
 ) -> AgentState:
     """
@@ -93,6 +97,21 @@ def create_initial_state(
     # Add the current user message
     messages.append(HumanMessage(content=user_message))
 
+    # Serialize retrieved docs for state storage
+    serialized_docs = []
+    if retrieved_docs:
+        for doc in retrieved_docs:
+            if hasattr(doc, "content"):
+                serialized_docs.append({
+                    "content": doc.content,
+                    "source": doc.source,
+                    "score": doc.score,
+                    "doc_id": doc.doc_id,
+                    "chunk_index": doc.chunk_index,
+                })
+            elif isinstance(doc, dict):
+                serialized_docs.append(doc)
+
     return AgentState(
         messages=messages,
         session_id=session_id,
@@ -104,6 +123,7 @@ def create_initial_state(
         tool_results=[],
         final_answer=None,
         error=None,
+        retrieved_docs=serialized_docs,
         run_id=run_id,
         metadata={},
     )

@@ -25,6 +25,8 @@ from backend.db.repositories.chat_repo import chat_message_repo, chat_session_re
 from backend.llm import get_llm_router
 from backend.llm.router import LLMRouter
 from backend.observability.logger import get_logger
+from backend.memory.manager import MemoryManager, get_memory_manager
+from backend.rag.retriever import get_retriever
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/chat", tags=["Chat"])
@@ -93,6 +95,7 @@ async def chat(
     user: CurrentUser,
     llm: Annotated[LLMRouter, Depends(get_llm_router)],
     agent_factory: Annotated[AgentFactory, Depends(get_agent_factory)],
+    memory: Annotated["MemoryManager", Depends(get_memory_manager)],
 ) -> ChatResponse:
     """
     Send a message to the AI agent and receive a response.
@@ -128,13 +131,22 @@ async def chat(
         content=request.message,
     )
 
-    # 3. Load conversation history
-    history = await chat_message_repo.get_conversation_history(
-        db, session.id, limit=20
+    # 3. Load memory context (short-term history + long-term relevant memories)
+    memory_context = await memory.load_context(
+        session_id=str(session.id),
+        user_id=str(user.id),
+        current_query=request.message,
     )
-    history = [h for h in history if h["content"] != request.message]
 
-    # 4. Run ReAct agent
+    # 4. Retrieve relevant documents (RAG)
+    retriever = get_retriever()
+    retrieved_docs = await retriever.retrieve_for_agent(
+        query=request.message,
+        session_id=str(session.id),
+        top_k=5,
+    )
+
+    # 5. Run ReAct agent
     start_time = time.perf_counter()
     agent = agent_factory.get_agent(request.agent_type)
 
@@ -143,7 +155,8 @@ async def chat(
             user_message=request.message,
             session_id=str(session.id),
             user_id=str(user.id),
-            conversation_history=history,
+            conversation_history=memory_context.conversation_history,
+            retrieved_docs=retrieved_docs,
         )
     except Exception as e:
         logger.error("agent_run_failed", error=str(e), session_id=str(session.id))
@@ -157,7 +170,15 @@ async def chat(
     steps = final_state.get("step_count", 0)
     tools_used = [r["tool"] for r in final_state.get("tool_results", [])]
 
-    # 5. Persist assistant response
+    # 5. Save turn to memory (Redis short-term)
+    await memory.save_turn(
+        session_id=str(session.id),
+        user_id=str(user.id),
+        user_message=request.message,
+        assistant_response=answer,
+    )
+
+    # 6. Persist assistant response to PostgreSQL
     assistant_message = await chat_message_repo.create_message(
         db,
         session_id=session.id,
@@ -169,7 +190,7 @@ async def chat(
         latency_ms=latency_ms,
     )
 
-    # 6. Update session counters
+    # 7. Update session counters
     await chat_session_repo.increment_counters(
         db, session.id, tokens=0, messages=2
     )

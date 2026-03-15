@@ -67,6 +67,7 @@ class BaseAgent(ABC):
         session_id: str,
         user_id: str,
         conversation_history: Optional[list[dict]] = None,
+        retrieved_docs: Optional[list] = None,
         run_id: Optional[str] = None,
         **kwargs: Any,
     ) -> AgentState:
@@ -88,6 +89,7 @@ class BaseAgent(ABC):
             agent_type=self.agent_type,
             max_steps=self.max_steps,
             conversation_history=conversation_history,
+            retrieved_docs=retrieved_docs,
             run_id=run_id,
         )
 

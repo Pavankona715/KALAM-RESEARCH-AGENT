@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.api.dependencies import CurrentUser, DBSession, Pagination
 from backend.config.settings import get_settings
@@ -134,8 +134,24 @@ async def upload_document(
         user_id=str(user.id),
     )
 
-    # TODO: Trigger async ingestion task (Step 11)
-    # await ingestion_pipeline.ingest_async(doc.id)
+    # Trigger full ingestion pipeline as background task
+    import asyncio
+    from backend.ingestion.pipeline import get_ingestion_pipeline
+
+    async def _ingest():
+        try:
+            pipeline = get_ingestion_pipeline()
+            await pipeline.ingest_file(
+                file_path=file_path,
+                doc_id=str(doc.id),
+                filename=doc.original_filename,
+                user_id=str(user.id),
+                doc_type=_ext_to_doc_type(extension),
+            )
+        except Exception as e:
+            logger.error("background_ingestion_failed", doc_id=str(doc.id), error=str(e))
+
+    asyncio.create_task(_ingest())
 
     return DocumentResponse(
         id=doc.id,
@@ -216,3 +232,58 @@ async def delete_document(
 
     await doc_repo.delete(db, doc_id)
     logger.info("document_deleted", doc_id=str(doc_id), user_id=str(user.id))
+
+
+class URLIngestRequest(BaseModel):
+    url: str = Field(..., min_length=10, max_length=2000)
+    title: Optional[str] = None
+
+
+@router.post("/url", response_model=DocumentResponse, status_code=status.HTTP_202_ACCEPTED)
+async def ingest_url(
+    request: URLIngestRequest,
+    db: DBSession,
+    user: CurrentUser,
+) -> DocumentResponse:
+    """
+    Ingest a web page URL into the knowledge base.
+    Fetches the page, extracts text, chunks, embeds, and stores.
+    Returns 202 Accepted — ingestion runs in the background.
+    """
+    import asyncio
+    from backend.ingestion.pipeline import get_ingestion_pipeline
+
+    doc = await doc_repo.create(
+        db,
+        owner_id=user.id,
+        filename=request.url,
+        original_filename=request.url,
+        doc_type="url",
+        source_url=request.url,
+        title=request.title or request.url[:100],
+        status="pending",
+        content_preview="Fetching...",
+    )
+
+    async def _ingest():
+        try:
+            pipeline = get_ingestion_pipeline()
+            await pipeline.ingest_url(
+                url=request.url,
+                doc_id=str(doc.id),
+                user_id=str(user.id),
+            )
+        except Exception as e:
+            logger.error("url_ingestion_failed", doc_id=str(doc.id), error=str(e))
+
+    asyncio.create_task(_ingest())
+
+    return DocumentResponse(
+        id=doc.id,
+        filename=doc.original_filename,
+        doc_type=doc.doc_type,
+        status=doc.status,
+        file_size_bytes=None,
+        chunk_count=0,
+        created_at=doc.created_at.isoformat(),
+    )

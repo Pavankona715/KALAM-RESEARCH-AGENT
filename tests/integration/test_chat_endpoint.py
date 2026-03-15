@@ -60,6 +60,7 @@ class TestChatEndpoint:
         from backend.llm.router import get_llm_router
 
         # Clone app but remove the auth override so auth is enforced
+        from backend.agents.orchestrator import get_agent_factory
         auth_app = app
         del auth_app.dependency_overrides[get_current_user]
         # Keep the LLM mock so auth check happens before any LLM call
@@ -167,10 +168,16 @@ class TestUploadEndpoint:
 class TestSearchEndpoint:
     @pytest.mark.asyncio
     async def test_search_returns_results_structure(self, client: AsyncClient):
-        response = await client.post("/search", json={
-            "query": "machine learning algorithms",
-            "top_k": 3,
-        })
+        # Mock get_retriever so no embedding API call is made
+        from unittest.mock import patch, AsyncMock, MagicMock
+        from backend.rag.retriever import Retriever
+        mock_retriever = MagicMock(spec=Retriever)
+        mock_retriever.retrieve = AsyncMock(return_value=[])
+        with patch("backend.api.routes.search.get_retriever", return_value=mock_retriever):
+            response = await client.post("/search", json={
+                "query": "machine learning algorithms",
+                "top_k": 3,
+            })
         assert response.status_code == 200
         data = response.json()
         assert "query" in data

@@ -129,10 +129,25 @@ def mock_agent_factory():
     return factory
 
 
+@pytest.fixture
+def mock_memory_manager():
+    """Mock MemoryManager so tests don't need Redis."""
+    from backend.memory.manager import MemoryManager, MemoryContext
+    manager = MagicMock(spec=MemoryManager)
+    manager.load_context = AsyncMock(return_value=MemoryContext(
+        conversation_history=[],
+        relevant_memories=[],
+        session_turn_count=0,
+    ))
+    manager.save_turn = AsyncMock(return_value=None)
+    manager.clear_session = AsyncMock(return_value=None)
+    return manager
+
+
 # ─── FastAPI Test App ──────────────────────────────────────────────────────────
 
 @pytest_asyncio.fixture
-async def app(mock_user, mock_llm, mock_agent_factory, test_db):
+async def app(mock_user, mock_llm, mock_agent_factory, mock_memory_manager, test_db):
     """
     FastAPI test app with all external dependencies mocked.
 
@@ -156,6 +171,7 @@ async def app(mock_user, mock_llm, mock_agent_factory, test_db):
     from backend.api.dependencies import get_current_user, get_db_session
     from backend.llm.router import get_llm_router
     from backend.agents.orchestrator import get_agent_factory
+    from backend.memory.manager import get_memory_manager
     from backend.observability.logger import configure_logging
 
     configure_logging()
@@ -200,6 +216,7 @@ async def app(mock_user, mock_llm, mock_agent_factory, test_db):
     test_app.dependency_overrides[get_current_user] = lambda: mock_user
     test_app.dependency_overrides[get_llm_router] = lambda: mock_llm
     test_app.dependency_overrides[get_agent_factory] = lambda: mock_agent_factory
+    test_app.dependency_overrides[get_memory_manager] = lambda: mock_memory_manager
 
     return test_app
 

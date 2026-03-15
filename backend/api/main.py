@@ -80,12 +80,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             raise
         logger.warning("redis_unavailable", error=str(e), note="continuing in dev mode")
 
-    # Verify Qdrant (non-fatal in development)
+    # Initialize Qdrant and ensure collections exist
     try:
-        from qdrant_client import AsyncQdrantClient
-        qclient = AsyncQdrantClient(url=settings.qdrant_url, timeout=3)
-        await qclient.get_collections()
-        await qclient.close()
+        from backend.vectordb.factory import ensure_collections_exist
+        await ensure_collections_exist()
         logger.info("qdrant_ready")
     except Exception as e:
         if settings.is_production:
